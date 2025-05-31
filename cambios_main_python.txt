@@ -52,6 +52,38 @@ def get_zone_by_prefix(db, called_number: str) -> int:
         return 1  # Zona por defecto en caso de error
 
 
+def get_rate_by_zone(db, zona_id: int) -> float:
+    """
+    Obtiene la tarifa por minuto para una zona específica
+    
+    Args:
+        db: Sesión de base de datos
+        zona_id: ID de la zona
+    
+    Returns:
+        float: Tarifa por minuto, o tarifa por defecto si no encuentra
+    """
+    try:
+        query = text("""
+            SELECT costo_por_minuto 
+            FROM tarifas 
+            WHERE zona_id = :zona_id 
+            LIMIT 1
+        """)
+        
+        result = db.execute(query, {"zona_id": zona_id}).fetchone()
+        
+        if result:
+            return float(result[0])
+        else:
+            print(f"⚠️  No se encontró tarifa para zona {zona_id}, usando tarifa por defecto")
+            return 0.05  # Tarifa por defecto: 5 centavos por minuto
+            
+    except Exception as e:
+        print(f"Error obteniendo tarifa para zona {zona_id}: {e}")
+        return 0.05  # Tarifa por defecto en caso de error
+
+
 # API Principal - Modificada para usar zonas y tarifas
 @app.post("/cdr")
 def create_cdr(event: CallEvent):
