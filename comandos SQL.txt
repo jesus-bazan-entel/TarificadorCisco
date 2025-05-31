@@ -1,0 +1,98 @@
+
+Comando 1:
+pg_dump -h localhost -p 5432 -U postgres -d tarificador --verbose --no-owner --no-privileges > backup_BD.sql
+
+Comando 2:
+zip backup_BD.zip backup_BD.sql
+
+Luego me envias por correo el archivo backup_BD.zip
+
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+        # Hashear el PIN para almacenarlo de forma segura
+        try:
+            hashed_pin = pwd_context.hash(pin)
+        except Exception as e:
+            print(f"Error al hashear PIN: {e}")
+            raise HTTPException(status_code=500, detail="Error al procesar el PIN")
+        
+        # Preparar los parámetros para la inserción, garantizando valores por defecto para campos opcionales
+        params = {
+            "numero": anexo.numero,
+            "usuario": anexo.usuario,
+            "area_nivel1": anexo.area_nivel1,
+            "area_nivel2": anexo.area_nivel2 if hasattr(anexo, 'area_nivel2') and anexo.area_nivel2 else "",
+            "area_nivel3": anexo.area_nivel3 if hasattr(anexo, 'area_nivel3') and anexo.area_nivel3 else "",
+            "pin": hashed_pin,
+            "activo": anexo.activo if hasattr(anexo, 'activo') else True
+        }
+
+
+CREATE OR REPLACE FUNCTION get_zone_for_number(numero TEXT) 
+RETURNS INTEGER AS $$
+DECLARE
+    clean_number TEXT;
+    zona_result INTEGER;
+    prefijo_record RECORD;
+BEGIN
+    -- Limpiar número (solo dígitos)
+    clean_number := regexp_replace(numero, '[^0-9]', '', 'g');
+    
+    -- Si está vacío, retorna zona por defecto
+    IF clean_number = '' OR clean_number IS NULL THEN
+        RETURN 1;
+    END IF;
+    
+    -- Buscar prefijo que coincida (ordenado por longitud descendente para priorizar específicos)
+    FOR prefijo_record IN 
+        SELECT zona_id, prefijo, longitud_minima, longitud_maxima
+        FROM prefijos 
+        ORDER BY LENGTH(prefijo) DESC, prefijo
+    LOOP
+        -- Verificar si el número empieza con este prefijo
+        IF clean_number LIKE prefijo_record.prefijo || '%' THEN
+            -- Verificar longitud
+            IF (prefijo_record.longitud_minima IS NULL OR LENGTH(clean_number) >= prefijo_record.longitud_minima) AND
+               (prefijo_record.longitud_maxima IS NULL OR LENGTH(clean_number) <= prefijo_record.longitud_maxima) THEN
+                RETURN prefijo_record.zona_id;
+            END IF;
+        END IF;
+    END LOOP;
+    
+    -- Si no encuentra coincidencia, retorna zona por defecto
+    RETURN 1;
+END;
+$$ LANGUAGE plpgsql;
+
+BEGIN;
+
+-- Actualizar zonas usando la función
+UPDATE cdr 
+SET zona_id = get_zone_for_number(called_number)
+WHERE zona_id != get_zone_for_number(called_number);
+
+-- Ver cuántos registros se actualizaron
+-- (El número debe coincidir con las estadísticas del PASO 5)
+
+COMMIT;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
