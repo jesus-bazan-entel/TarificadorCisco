@@ -947,55 +947,194 @@ class TarifaCreate(BaseModel):
     zona_id: int
     tarifa_segundo: float
 
+
+def get_rate_by_zone(db, zona_id: int) -> float:
+    """
+    Obtiene la tarifa por minuto para una zona específica
+    CORREGIDA: Usa tarifa_segundo y la convierte a tarifa por minuto
+    
+    Args:
+        db: Sesión de base de datos
+        zona_id: ID de la zona
+    
+    Returns:
+        float: Tarifa por minuto, o tarifa por defecto si no encuentra
+    """
+    try:
+        query = text("""
+            SELECT tarifa_segundo 
+            FROM tarifas 
+            WHERE zona_id = :zona_id 
+              AND activa = true
+            ORDER BY fecha_inicio DESC
+            LIMIT 1
+        """)
+        
+        result = db.execute(query, {"zona_id": zona_id}).fetchone()
+        
+        if result and result[0] is not None:
+            # Convertir de tarifa por segundo a tarifa por minuto
+            tarifa_por_segundo = float(result[0])
+            tarifa_por_minuto = tarifa_por_segundo * 60
+            return tarifa_por_minuto
+        else:
+            print(f"⚠️  No se encontró tarifa activa para zona {zona_id}, usando tarifa por defecto")
+            return 3.0  # Tarifa por defecto: 3.0 por minuto (0.05 por segundo * 60)
+            
+    except Exception as e:
+        print(f"Error obteniendo tarifa para zona {zona_id}: {e}")
+        return 3.0  # Tarifa por defecto en caso de error
+
+
+# ===== FUNCIÓN CORREGIDA PARA DETERMINAR ZONA POR PREFIJO =====
+def get_zone_by_prefix(db, called_number: str) -> int:
+    """
+    Determina la zona basándose en el prefijo del número marcado
+    CORREGIDA: Mejor manejo de errores y casos edge
+    
+    Args:
+        db: Sesión de base de datos
+        called_number: Número de destino marcado
+    
+    Returns:
+        int: ID de la zona correspondiente, o zona por defecto si no encuentra
+    """
+    if not called_number:
+        return 1  # Zona por defecto para números vacíos
+    
+    # Limpiar el número (quitar espacios, guiones, etc.)
+    clean_number = ''.join(filter(str.isdigit, str(called_number)))
+    
+    if not clean_number:
+        return 1  # Zona por defecto si no hay dígitos
+    
+    try:
+        # Obtener todos los prefijos ordenados por longitud descendente
+        # Esto prioriza prefijos más específicos (más largos) sobre los generales
+        query = text("""
+            SELECT zona_id, prefijo, longitud_minima, longitud_maxima
+            FROM prefijos 
+            ORDER BY LENGTH(prefijo) DESC, prefijo
+        """)
+        
+        prefijos = db.execute(query).fetchall()
+        
+        for prefijo_row in prefijos:
+            zona_id, prefijo, long_min, long_max = prefijo_row
+            
+            # Verificar si el número empieza con este prefijo
+            if clean_number.startswith(str(prefijo)):
+                # Verificar longitud del número
+                if long_min and len(clean_number) < long_min:
+                    continue
+                if long_max and len(clean_number) > long_max:
+                    continue
+                
+                # ¡Encontramos la zona!
+                return zona_id
+        
+        # Si no se encuentra ningún prefijo, usar zona por defecto
+        print(f"⚠️  No se encontró zona para el número: {called_number} (limpio: {clean_number})")
+        return 1  # Zona por defecto (puedes cambiar este valor)
+        
+    except Exception as e:
+        print(f"Error determinando zona para {called_number}: {e}")
+        return 1  # Zona por defecto en caso de error
+
+
 # API Principal - Modificada para usar zonas y tarifas
 @app.post("/cdr")
 def create_cdr(event: CallEvent):
     db = SessionLocal()
     
-    # Calcular el costo basado en duration_billable (duración facturable)
-    cost = (event.duration_billable / 60) * 0.05  # 5 centavos por minuto
-    
-    # Crear el CDR mapeando answer_time a connect_time
-    cdr_data = {
-        "calling_number": event.calling_number,
-        "called_number": event.called_number,
-        "start_time": event.start_time,
-        "end_time": event.end_time,
-        "duration_seconds": event.duration_seconds,
-        "duration_billable": event.duration_billable,
-        "cost": cost,
-        "status": event.status,
-        "direction": event.direction,
-        "release_cause": event.release_cause,
-        "connect_time": event.answer_time,  # Mapear answer_time a connect_time
-        "dialing_time": event.dialing_time,
-        "network_reached_time": event.network_reached_time,
-        "network_alerting_time": event.network_alerting_time,
-        "zona_id": 2  # O calcular según la lógica de tu sistema
-    }
-    
-    cdr = CDR(**cdr_data)
-    db.add(cdr)
-    
-    # Actualizar el saldo (usando el costo calculado)
-    db.execute(
-        text("UPDATE saldo_anexos SET saldo = saldo - :cost WHERE calling_number = :calling_number"),
-        {"cost": cost, "calling_number": event.calling_number}
-    )
-    
-    # Verificar saldo bajo
-    nuevo_saldo = db.execute(
-        text("SELECT saldo FROM saldo_anexos WHERE calling_number = :calling_number"),
-        {"calling_number": event.calling_number}
-    ).fetchone()
-    
-    if nuevo_saldo and nuevo_saldo[0] < 1.0:
-        # Aquí puedes programar enviar correo o alerta
-        pass
-    
-    db.commit()
-    db.close()
-    return {"message": "CDR saved", "cost": cost}
+    try:
+        # 1. Determinar la zona basándose en el prefijo
+        zona_id = get_zone_by_prefix(db, event.called_number)
+        
+        # 2. Obtener la tarifa específica para esa zona
+        rate_per_minute = get_rate_by_zone(db, zona_id)
+        
+        # 3. Calcular el costo basado en duration_billable y tarifa de la zona
+        cost = (event.duration_billable / 60) * rate_per_minute
+        
+        # 4. Crear el CDR con la zona determinada automáticamente
+        cdr_data = {
+            "calling_number": event.calling_number,
+            "called_number": event.called_number,
+            "start_time": event.start_time,
+            "end_time": event.end_time,
+            "duration_seconds": event.duration_seconds,
+            "duration_billable": event.duration_billable,
+            "cost": cost,
+            "status": event.status,
+            "direction": event.direction,
+            "release_cause": event.release_cause,
+            "connect_time": event.answer_time,  # Mapear answer_time a connect_time
+            "dialing_time": event.dialing_time,
+            "network_reached_time": event.network_reached_time,
+            "network_alerting_time": event.network_alerting_time,
+            "zona_id": zona_id  # ¡Ahora se calcula automáticamente!
+        }
+        
+        # 5. Guardar el CDR
+        cdr = CDR(**cdr_data)
+        db.add(cdr)
+        
+        # 6. Actualizar el saldo del anexo
+        update_result = db.execute(
+            text("UPDATE saldo_anexos SET saldo = saldo - :cost WHERE calling_number = :calling_number"),
+            {"cost": cost, "calling_number": event.calling_number}
+        )
+        
+        # 7. Verificar si se actualizó el saldo (anexo existe)
+        if update_result.rowcount == 0:
+            print(f"⚠️  Anexo {event.calling_number} no encontrado en saldo_anexos")
+            # Opcional: crear registro de saldo para el anexo
+            # db.execute(
+            #     text("INSERT INTO saldo_anexos (calling_number, saldo) VALUES (:calling_number, :saldo)"),
+            #     {"calling_number": event.calling_number, "saldo": -cost}
+            # )
+        
+        # 8. Verificar saldo bajo y generar alerta si es necesario
+        nuevo_saldo_result = db.execute(
+            text("SELECT saldo FROM saldo_anexos WHERE calling_number = :calling_number"),
+            {"calling_number": event.calling_number}
+        ).fetchone()
+        
+        if nuevo_saldo_result:
+            nuevo_saldo = nuevo_saldo_result[0]
+            if nuevo_saldo < 1.0:
+                # TODO: Enviar alerta de saldo bajo
+                print(f"🚨 ALERTA: Anexo {event.calling_number} con saldo bajo: ${nuevo_saldo:.2f}")
+                # Aquí puedes programar enviar correo o alerta
+        
+        # 9. Confirmar transacción
+        db.commit()
+        
+        # 10. Obtener información de la zona para logging/debugging
+        zona_info = db.execute(
+            text("SELECT nombre FROM zonas WHERE id = :zona_id"),
+            {"zona_id": zona_id}
+        ).fetchone()
+        
+        zona_nombre = zona_info[0] if zona_info else "Desconocida"
+        
+        return {
+            "message": "CDR saved successfully",
+            "cdr_id": cdr.id if hasattr(cdr, 'id') else None,
+            "cost": round(cost, 4),
+            "zona_id": zona_id,
+            "zona_nombre": zona_nombre,
+            "rate_per_minute": rate_per_minute,
+            "duration_billed_minutes": round(event.duration_billable / 60, 4)
+        }
+        
+    except Exception as e:
+        db.rollback()
+        print(f"Error creando CDR: {e}")
+        raise HTTPException(status_code=500, detail=f"Error guardando CDR: {str(e)}")
+    finally:
+        db.close()
 
 
 # Nuevo endpoint para verificar saldo con destino
@@ -2970,7 +3109,7 @@ def export_cdr_pdf(
                         <td>{{ "%d:%02d"|format(row[4]//60, row[4]%60) }}</td>
                         <td>{{ "%d:%02d"|format(row[5]//60, row[5]%60) }}</td>
                         <td>{{ row[8] or 'N/A' }}</td>
-                        <td>S/{{ "%.4f"|format(row[6]) }}</td>
+                        <td>S/{{ "%.6f"|format(row[6]) }}</td>
                     </tr>
                 {% endfor %}
                 </tbody>
@@ -3240,7 +3379,7 @@ def export_cdr_excel(
             # Estilos
             header_style = xlwt.easyxf('font: bold on; align: wrap on, vert centre, horiz center; pattern: pattern solid, fore_color gray25')
             date_style = xlwt.easyxf(num_format_str='YYYY-MM-DD HH:MM:SS')
-            number_style = xlwt.easyxf(num_format_str='0.0000')
+            number_style = xlwt.easyxf(num_format_str='0.000000')
             
             # Establecer anchos de columna
             for i in range(len(headers)):
